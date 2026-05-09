@@ -1,0 +1,13 @@
+[Unit]
+Description=VPN Web Panel
+After=network.target xray.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/vpn-panel/app.py
+WorkingDirectory=/opt/vpn-panel
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

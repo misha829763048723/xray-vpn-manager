@@ -1,0 +1,481 @@
+#!/bin/bash
+SUB_URL="https://3b8fd492.withblancvpn.online/s/c69ec8720ff24a679ee8573a016669d9"
+CONFIG="/etc/xray/config.json"
+MAX_PING=500
+CHECK_URL="https://api.ipify.org"
+LOG="/var/log/vpn-watchdog.log"
+SUB_CACHE="/tmp/vpn-sub-cache"
+SUB_CACHE_TTL=300
+
+_get_servers() {
+    if [ -f "$SUB_CACHE" ]; then
+        local age=$(( $(date +%s) - $(stat -c %Y "$SUB_CACHE") ))
+        if [ "$age" -lt "$SUB_CACHE_TTL" ]; then
+            cat "$SUB_CACHE"
+            return
+        fi
+    fi
+    local raw data
+    for i in 1 2 3; do
+        raw=$(curl -sL --max-time 15 "$SUB_URL" 2>/dev/null)
+        [ -n "$raw" ] && break
+        sleep 2
+    done
+    if [ -n "$raw" ]; then
+        data=$(echo "$raw" | base64 -d 2>/dev/null)
+        if [ -n "$data" ]; then
+            echo "$data" > "$SUB_CACHE"
+            echo "$data"
+            return
+        fi
+    fi
+    if [ -f "$SUB_CACHE" ]; then
+        echo "⚠ Подписка недоступна, используем кэш" >&2
+        cat "$SUB_CACHE"
+    fi
+}
+
+_get_cdn_servers() {
+    _get_servers | grep -v "Россия" | grep -v "Whitelist"
+}
+
+_get_whitelist_servers() {
+    _get_servers | grep -v "Россия" | grep "Whitelist"
+}
+
+_current_host() {
+    python3 -c "import json; d=json.load(open('$CONFIG')); print(d['outbounds'][0]['settings']['vnext'][0]['address'])" 2>/dev/null
+}
+
+_set_server() {
+    local vless_line="$1"
+    sudo python3 << PYEOF
+import json, re
+from urllib.parse import unquote
+
+line = '''$vless_line'''
+m = re.match(r'vless://([^@]+)@([^:]+):(\d+)\?([^#]*)', line)
+if not m:
+    print("ERROR: invalid VLESS line")
+    exit(1)
+
+uuid, host, port, params_str = m.groups()
+port = int(port)
+params = dict(p.split('=', 1) for p in params_str.split('&') if '=' in p)
+
+security = params.get('security', 'tls')
+flow = params.get('flow', '')
+fp = params.get('fp', 'chrome')
+sni = params.get('sni', host)
+net = params.get('type', 'tcp')
+
+with open('$CONFIG') as f:
+    cfg = json.load(f)
+
+out = cfg['outbounds'][0]
+vnext = out['settings']['vnext'][0]
+vnext['address'] = host
+vnext['port'] = port
+vnext['users'][0]['flow'] = unquote(flow)
+
+ss = out['streamSettings']
+ss['network'] = net
+ss['security'] = security
+for k in ('tlsSettings', 'realitySettings', 'wsSettings',
+          'tcpSettings', 'httpSettings', 'grpcSettings'):
+    ss.pop(k, None)
+
+if security == 'reality':
+    ss['realitySettings'] = {
+        'serverName': sni,
+        'publicKey': params.get('pbk', ''),
+        'shortId': params.get('sid', ''),
+        'fingerprint': fp,
+    }
+else:
+    tls = {'serverName': sni, 'fingerprint': fp}
+    if sni != host:
+        tls['alpn'] = []
+    else:
+        tls['alpn'] = [params.get('alpn', 'h2')]
+    if params.get('allowInsecure') == '1':
+        tls['allowInsecure'] = True
+    ss['tlsSettings'] = tls
+
+if net == 'ws':
+    ws = {'path': unquote(params.get('path', '/'))}
+    ws_host = params.get('host', '')
+    if ws_host:
+        ws['headers'] = {'Host': ws_host}
+    ss['wsSettings'] = ws
+
+with open('$CONFIG', 'w') as f:
+    json.dump(cfg, f, indent=2)
+print(f"OK: {host}:{port} ({security}+{net})")
+PYEOF
+    sudo systemctl restart xray
+    sleep 2
+}
+
+_tcp_ping() {
+    local host="$1" port="${2:-8443}"
+    local ms
+    ms=$(bash -c "time (echo > /dev/tcp/$host/$port)" 2>&1 \
+        | grep real | grep -oP '\d+\.\d+' | head -1 \
+        | awk '{printf "%d", $1*1000}')
+    echo "${ms:-9999}"
+}
+
+_tls_ping() {
+    local host="$1" sni="${2:-$1}" port="${3:-8443}"
+    python3 -c "
+import ssl, socket, time
+try:
+    t0 = time.time()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    raw = socket.create_connection(('$host', $port), timeout=5)
+    tls = ctx.wrap_socket(raw, server_hostname='$sni')
+    ms = int((time.time()-t0)*1000)
+    tls.close()
+    print(ms)
+except:
+    print(9999)
+" 2>/dev/null
+}
+
+_smart_ping() {
+    local line="$1"
+    local host port sni
+    host=$(echo "$line" | grep -oP '(?<=@)[^:]+')
+    port=$(echo "$line" | grep -oP '(?<=:)\d+(?=\?)')
+    sni=$(echo "$line" | grep -oP '(?<=sni=)[^&#]+')
+    [ -z "$sni" ] && sni="$host"
+    [ -z "$port" ] && port=8443
+    # TLS ping works for all server types:
+    # REALITY servers proxy plain TLS to the legitimate SNI site, so handshake succeeds
+    _tls_ping "$host" "$sni" "$port"
+}
+
+_tunnel_latency() {
+    local raw ms
+    raw=$(curl -s --max-time 8 -w "%{time_connect}" -o /dev/null "https://ifconfig.me" 2>/dev/null)
+    ms=$(echo "$raw" | awk '{ms=int($1*1000); print (ms>0) ? ms : 0}')
+    if [ "${ms:-0}" -gt 0 ] 2>/dev/null; then
+        echo "${ms} мс"
+    else
+        echo "н/д"
+    fi
+}
+
+_vpn_alive() {
+    local ip
+    ip=$(curl -s --max-time 8 "$CHECK_URL" 2>/dev/null)
+    [ -z "$ip" ] && return 1
+    local cc
+    cc=$(curl -s --max-time 5 "http://ip-api.com/json/$ip?fields=countryCode" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('countryCode',''))" 2>/dev/null)
+    [ "$cc" = "RU" ] && return 1
+    return 0
+}
+
+_best_from_list() {
+    local servers="$1"
+    local best_line="" best_ms=99999
+    if [ -z "$servers" ]; then
+        echo ""; return
+    fi
+    while IFS= read -r line; do
+        local host
+        host=$(echo "$line" | grep -oP '(?<=@)[^:]+')
+        [ -z "$host" ] && continue
+        local ms
+        ms=$(_smart_ping "$line")
+        if [ "$ms" -lt "$best_ms" ] 2>/dev/null && [ "$ms" -lt 9999 ]; then
+            best_ms=$ms
+            best_line="$line"
+        fi
+    done <<< "$servers"
+    echo "$best_line"
+}
+
+_best_server() {
+    _best_from_list "$(_get_cdn_servers)"
+}
+
+_tg_notify() {
+    local text="$1"
+    local token admin_id
+    if [ -f /etc/vpn-bot/env ]; then
+        token=$(grep '^TG_BOT_TOKEN=' /etc/vpn-bot/env | cut -d= -f2-)
+        admin_id=$(grep '^TG_ADMIN_ID=' /etc/vpn-bot/env | cut -d= -f2-)
+    fi
+    [ -z "$token" ] || [ -z "$admin_id" ] && return 0
+    python3 -c "
+import sys, json, urllib.request
+token, admin_id, text = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    data = json.dumps({'chat_id': admin_id, 'text': text, 'parse_mode': 'HTML'}).encode()
+    req = urllib.request.Request(
+        f'https://api.telegram.org/bot{token}/sendMessage',
+        data=data, headers={'Content-Type': 'application/json'})
+    urllib.request.urlopen(req, timeout=10)
+except: pass
+" "$token" "$admin_id" "$text" 2>/dev/null
+}
+
+case "$1" in
+
+  status)
+    echo "=== VPN статус ==="
+    systemctl is-active xray && echo "Xray: РАБОТАЕТ" || echo "Xray: ОСТАНОВЛЕН"
+    echo "Текущий сервер: $(_current_host)"
+    echo -n "Внешний IP: "
+    IP=$(curl -s --max-time 8 "$CHECK_URL"); echo "$IP"
+    GEO=$(curl -s --max-time 5 "http://ip-api.com/json/$IP?fields=country,city" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('city','?')+', '+d.get('country','?'))" 2>/dev/null)
+    echo "Геолокация: $GEO"
+    echo -n "Задержка туннеля: "
+    echo "$(_tunnel_latency)"
+    systemctl is-active --quiet vpn-watchdog.timer \
+        && echo "Watchdog: ВКЛЮЧЁН" || echo "Watchdog: выключен"
+    ;;
+
+  ping)
+    echo "=== Пинг CDN серверов (TLS) ==="
+    echo ""
+    current=$(_current_host)
+    results=()
+    servers=$(_get_cdn_servers)
+    if [ -z "$servers" ]; then
+        echo "  ❌ Не удалось получить список серверов"
+        exit 1
+    fi
+    while IFS= read -r line; do
+        host=$(echo "$line" | grep -oP '(?<=@)[^:]+')
+        name=$(echo "$line" | grep -oP '(?<=#).*')
+        [ -z "$host" ] && continue
+        ms=$(_smart_ping "$line")
+        marker=""
+        [ "$host" = "$current" ] && marker=" ◀ текущий"
+        if [ "$ms" -ge 9999 ] 2>/dev/null; then
+            label="недоступен$marker"
+            results+=("99999|$name|$label")
+        else
+            results+=("$(printf '%05d' $ms)|$name|${ms}мс$marker")
+        fi
+    done <<< "$servers"
+    if [ ${#results[@]} -eq 0 ]; then
+        echo "  ❌ Серверы не найдены"
+    else
+        printf '%s\n' "${results[@]}" | sort -t'|' -k1 -n | uniq \
+            | while IFS='|' read -r _ name label; do
+                echo "  $label  — $name"
+            done
+    fi
+    echo ""
+    echo "Туннель сейчас: $(_tunnel_latency)"
+    ;;
+
+  list)
+    echo "=== CDN серверы ==="
+    servers=$(_get_cdn_servers)
+    if [ -z "$servers" ]; then
+        echo "  ❌ Не удалось получить список серверов"
+        exit 1
+    fi
+    echo "$servers" | grep -oP '(?<=#).*' | nl -w3 -s'. '
+    ;;
+
+  server)
+    [ -z "$2" ] && { echo "Использование: vpn server <номер>"; echo "Список: vpn list"; exit 1; }
+    line=$(_get_cdn_servers | sed -n "${2}p")
+    [ -z "$line" ] && { echo "Сервер $2 не найден"; exit 1; }
+    name=$(echo "$line" | grep -oP '(?<=#).*')
+    echo "Переключаюсь на: $name"
+    _set_server "$line"
+    IP=$(curl -s --max-time 8 $CHECK_URL)
+    GEO=$(curl -s --max-time 5 "http://ip-api.com/json/$IP?fields=country,city" 2>/dev/null \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('city','?')+', '+d.get('country','?'))" 2>/dev/null)
+    echo "Новый IP: $IP ($GEO)"
+    ;;
+
+  best)
+    echo "Ищу лучший CDN сервер..."
+    best_line=$(_best_server)
+    [ -z "$best_line" ] && { echo "Не удалось получить список серверов"; exit 1; }
+    name=$(echo "$best_line" | grep -oP '(?<=#).*')
+    echo "Лучший: $name"
+    _set_server "$best_line"
+    echo "Новый IP: $(curl -s --max-time 8 $CHECK_URL)"
+    ;;
+
+  whitelist)
+    case "$2" in
+      list)
+        echo "=== Whitelist серверы ==="
+        servers=$(_get_whitelist_servers)
+        if [ -z "$servers" ]; then
+            echo "  ❌ Не удалось получить список серверов"
+            exit 1
+        fi
+        echo "$servers" | grep -oP '(?<=#).*' | nl -w3 -s'. '
+        ;;
+      server)
+        [ -z "$3" ] && { echo "Использование: vpn whitelist server <номер>"; echo "Список: vpn whitelist list"; exit 1; }
+        line=$(_get_whitelist_servers | sed -n "${3}p")
+        [ -z "$line" ] && { echo "Сервер $3 не найден"; exit 1; }
+        name=$(echo "$line" | grep -oP '(?<=#).*')
+        echo "Переключаюсь на: $name"
+        _set_server "$line"
+        IP=$(curl -s --max-time 8 $CHECK_URL)
+        echo "Новый IP: $IP"
+        ;;
+      best)
+        echo "Ищу лучший Whitelist сервер..."
+        best_line=$(_best_from_list "$(_get_whitelist_servers)")
+        [ -z "$best_line" ] && { echo "Не удалось получить список серверов"; exit 1; }
+        name=$(echo "$best_line" | grep -oP '(?<=#).*')
+        echo "Лучший: $name"
+        _set_server "$best_line"
+        echo "Новый IP: $(curl -s --max-time 8 $CHECK_URL)"
+        ;;
+      ping)
+        echo "=== Пинг Whitelist серверов ==="
+        echo ""
+        current=$(_current_host)
+        results=()
+        servers=$(_get_whitelist_servers)
+        if [ -z "$servers" ]; then
+            echo "  ❌ Не удалось получить список серверов"
+            exit 1
+        fi
+        while IFS= read -r line; do
+            host=$(echo "$line" | grep -oP '(?<=@)[^:]+')
+            name=$(echo "$line" | grep -oP '(?<=#).*')
+            [ -z "$host" ] && continue
+            ms=$(_smart_ping "$line")
+            marker=""
+            [ "$host" = "$current" ] && marker=" ◀ текущий"
+            if [ "$ms" -ge 9999 ] 2>/dev/null; then
+                label="недоступен$marker"
+                results+=("99999|$name|$label")
+            else
+                results+=("$(printf '%05d' $ms)|$name|${ms}мс$marker")
+            fi
+        done <<< "$servers"
+        printf '%s\n' "${results[@]}" | sort -t'|' -k1 -n | uniq \
+            | while IFS='|' read -r _ name label; do
+                echo "  $label  — $name"
+            done
+        ;;
+      *)
+        echo "Использование: vpn whitelist <команда>"
+        echo ""
+        echo "  vpn whitelist list          — список Whitelist серверов"
+        echo "  vpn whitelist server <N>    — переключиться на сервер N"
+        echo "  vpn whitelist best          — лучший Whitelist по пингу"
+        echo "  vpn whitelist ping          — пинг всех Whitelist серверов"
+        ;;
+    esac
+    ;;
+
+  check)
+    [ -f /run/vpn-stopped ] && exit 0
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    current=$(_current_host)
+    # Find current server's full VLESS line to get SNI and security
+    current_line=$(grep "@${current}:" "$SUB_CACHE" 2>/dev/null | head -1)
+    if [ -n "$current_line" ]; then
+        ms=$(_smart_ping "$current_line")
+    else
+        port=$(python3 -c "import json; d=json.load(open('$CONFIG')); print(d['outbounds'][0]['settings']['vnext'][0]['port'])" 2>/dev/null)
+        ms=$(_tcp_ping "$current" "${port:-8443}")
+    fi
+    # Helper: switch to best_line and send TG notification
+    _do_switch() {
+        local reason="$1" best_line="$2"
+        local best_host old_name best_name new_ip
+        best_host=$(echo "$best_line" | grep -oP '(?<=@)[^:]+')
+        [ "$best_host" = "$current" ] && return
+        old_name=$(echo "$current_line" | grep -oP '(?<=#).*' | sed 's/%20/ /g')
+        [ -z "$old_name" ] && old_name="$current"
+        best_name=$(echo "$best_line" | grep -oP '(?<=#).*' | sed 's/%20/ /g')
+        [ -z "$best_name" ] && best_name="$best_host"
+        echo "$ts | SWITCH | $current → $best_host ($reason)" | tee -a "$LOG"
+        _set_server "$best_line"
+        new_ip=$(curl -s --max-time 8 "$CHECK_URL" 2>/dev/null)
+        _tg_notify "🔄 <b>Watchdog переключил сервер</b>
+Причина: $reason
+
+🔴 Было: $old_name
+🟢 Стало: $best_name
+🌐 Новый IP: ${new_ip:-н/д}
+🕐 $ts"
+    }
+
+    if ! _vpn_alive; then
+      echo "$ts | FAIL | $current | VPN недоступен → ищу лучший CDN" | tee -a "$LOG"
+      best_line=$(_best_server)
+      [ -n "$best_line" ] && _do_switch "VPN недоступен" "$best_line"
+    elif [ "$ms" -gt "$MAX_PING" ] 2>/dev/null; then
+      echo "$ts | HIGH_PING | $current | ${ms}мс → ищу лучший CDN" | tee -a "$LOG"
+      best_line=$(_best_server)
+      [ -n "$best_line" ] && _do_switch "Высокий пинг ${ms}мс > ${MAX_PING}мс" "$best_line"
+    else
+      echo "$ts | OK | $current | ${ms}мс" >> "$LOG"
+    fi
+    ;;
+
+  log)
+    tail -30 "$LOG" 2>/dev/null || echo "Лог пустой"
+    ;;
+
+  watchdog)
+    case "$2" in
+      on)  sudo systemctl enable --now vpn-watchdog.timer; echo "Watchdog ON" ;;
+      off) sudo systemctl disable --now vpn-watchdog.timer; echo "Watchdog OFF" ;;
+      *)   echo "Использование: vpn watchdog on|off" ;;
+    esac
+    ;;
+
+  stop)
+    sudo systemctl stop xray
+    sudo iptables -t mangle -D PREROUTING -j XRAY 2>/dev/null || true
+    sudo iptables -t mangle -D OUTPUT -j XRAY_SELF 2>/dev/null || true
+    echo "VPN остановлен, весь трафик идёт напрямую"
+    ;;
+  start)
+    sudo iptables -t mangle -C PREROUTING -j XRAY 2>/dev/null || \
+      sudo iptables -t mangle -I PREROUTING 1 -j XRAY
+    sudo iptables -t mangle -C OUTPUT -j XRAY_SELF 2>/dev/null || \
+      sudo iptables -t mangle -I OUTPUT 1 -j XRAY_SELF
+    sudo systemctl start xray
+    sleep 2
+    echo "IP: $(curl -s --max-time 8 $CHECK_URL)"
+    ;;
+  restart) sudo systemctl restart xray; sleep 2; echo "IP: $(curl -s --max-time 8 $CHECK_URL)" ;;
+
+  *)
+    echo "Использование: vpn <команда>"
+    echo ""
+    echo "  CDN серверы (основные):"
+    echo "    vpn status          — статус, IP, геолокация, задержка"
+    echo "    vpn list            — список CDN серверов"
+    echo "    vpn server <N>      — переключиться на CDN сервер N"
+    echo "    vpn best            — лучший CDN по пингу"
+    echo "    vpn ping            — пинг всех CDN серверов"
+    echo ""
+    echo "  Whitelist серверы (для белых списков):"
+    echo "    vpn whitelist list          — список"
+    echo "    vpn whitelist server <N>    — переключиться"
+    echo "    vpn whitelist best          — лучший по пингу"
+    echo "    vpn whitelist ping          — пинг всех"
+    echo ""
+    echo "  Общее:"
+    echo "    vpn watchdog on|off — авто-переключение (только CDN)"
+    echo "    vpn log             — лог переключений"
+    echo "    vpn start|stop|restart"
+    ;;
+esac

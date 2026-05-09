@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.bak
+*.log
+.env
+env
+/vpn-bot/env
+/xray/config.json
+*.dat
+/tmp/

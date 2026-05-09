@@ -1,0 +1,6 @@
+[Unit]
+Description=VPN Watchdog - auto switch on failure/high ping
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn check
