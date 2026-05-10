@@ -774,5 +774,27 @@ def api_routing_post():
     return jsonify({'ok': True, 'routing': get_custom_routing()})
 
 
+@app.route('/api/pi-stats')
+def api_pi_stats():
+    def _read(cmd):
+        try:
+            return subprocess.check_output(cmd, shell=True, text=True, timeout=3).strip()
+        except Exception:
+            return '—'
+
+    temp  = _read("vcgencmd measure_temp 2>/dev/null | sed 's/temp=//'")
+    cpu   = _read("top -bn1 | grep 'Cpu(s)' | awk '{printf \"%.1f\", $2+$4}'")
+    ram   = _read("free -m | awk 'NR==2{printf \"%.1f%% (%d/%d MB)\", $3*100/$2, $3, $2}'")
+    disk  = _read("df -h / | awk 'NR==2{printf \"%s (%s / %s)\", $5, $3, $2}'")
+    up    = _read("uptime -p | sed 's/up //'")
+    load  = _read("cat /proc/loadavg | awk '{print $1, $2, $3}'")
+    freq  = _read("vcgencmd measure_clock arm 2>/dev/null | sed 's/frequency(.*=//; s/$//' | awk '{printf \"%.0f MHz\", $1/1000000}'")
+
+    return jsonify({
+        'temp': temp, 'cpu': cpu, 'ram': ram,
+        'disk': disk, 'uptime': up, 'load': load, 'freq': freq,
+    })
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)

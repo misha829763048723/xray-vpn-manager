@@ -132,6 +132,9 @@ def main_keyboard(d: Dict[str, Any]) -> Dict:
             {'text': '📜 Logs', 'callback_data': 'logs'},
             {'text': '🔃 Refresh', 'callback_data': 'status'},
         ],
+        [
+            {'text': '🖥 Pi stats', 'callback_data': 'pistats'},
+        ],
     ]}
 
 
@@ -241,6 +244,7 @@ def cmd_help(chat_id: int):
         '/logs — последние строки watchdog\n'
         '/servers — список CDN с кнопками\n'
         '/wl — список Whitelist с кнопками\n'
+        '/pi — статус Raspberry Pi (температура, CPU, RAM, диск)\n'
         '/routing — управление раздельным туннелированием\n'
         '/direct &lt;домен/IP&gt; — добавить в обход VPN\n'
         '/proxy &lt;домен/IP&gt; — добавить в принудительный VPN\n'
@@ -374,6 +378,27 @@ def cmd_list(chat_id: int, kind: str, page: int = 0,
              reply_markup=server_list_keyboard(servers, page, kind))
 
 
+def cmd_pi_stats(chat_id: int, message_id: Optional[int] = None):
+    d = panel_get('pi-stats', timeout=10) or {}
+    if not d:
+        text = '⚠ Не удалось получить статус Pi'
+    else:
+        text = (
+            '🖥 <b>Raspberry Pi</b>\n\n'
+            f'🌡 <b>Температура:</b> {d.get("temp", "—")}\n'
+            f'⚙️ <b>CPU:</b> {d.get("cpu", "—")}%'
+            + (f'  <i>({d.get("freq", "")})</i>' if d.get("freq") else '') + '\n'
+            f'📊 <b>Нагрузка:</b> {d.get("load", "—")}\n'
+            f'🧠 <b>RAM:</b> {d.get("ram", "—")}\n'
+            f'💾 <b>Диск:</b> {d.get("disk", "—")}\n'
+            f'⏱ <b>Uptime:</b> {d.get("uptime", "—")}'
+        )
+    if message_id:
+        edit(chat_id, message_id, text)
+    else:
+        send(chat_id, text)
+
+
 def cmd_routing(chat_id: int, message_id: Optional[int] = None):
     d = panel_get('routing') or {}
     text = routing_text(d)
@@ -448,6 +473,8 @@ def handle_command(chat_id: int, text: str):
         cmd_list(chat_id, 'cdn', 0)
     elif cmd == '/wl':
         cmd_list(chat_id, 'wl', 0)
+    elif cmd in ('/pi', '/pistat', '/pistats'):
+        cmd_pi_stats(chat_id)
     elif cmd == '/routing':
         cmd_routing(chat_id)
     elif cmd == '/direct':
@@ -493,6 +520,8 @@ def handle_callback(cq: Dict[str, Any]):
             cmd_switch(chat_id, kind, host, message_id)
         elif data == 'routing':
             cmd_routing(chat_id, message_id)
+        elif data == 'pistats':
+            cmd_pi_stats(chat_id, message_id)
         elif data.startswith('rt:rm:'):
             # rt:rm:<target>:<entry>
             parts = data.split(':', 3)
