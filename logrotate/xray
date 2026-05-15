@@ -1,0 +1,8 @@
+/var/log/xray/*.log {
+    size 30M
+    rotate 3
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

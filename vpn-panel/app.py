@@ -17,9 +17,11 @@ CONFIG = '/etc/xray/config.json'
 SUB_CACHE = '/tmp/vpn-sub-cache'
 SUB_URL = 'https://3b8fd492.withblancvpn.online/s/c69ec8720ff24a679ee8573a016669d9'
 LOG_FILE = '/var/log/vpn-watchdog.log'
+ACCESS_LOG = '/var/log/xray/access.log'
 PROBE_PORT = 13344
 VPN_STOPPED_FLAG = '/run/vpn-stopped'
 _verify_lock = threading.Lock()
+_rdns_cache = {}  # ip -> hostname (or '' if no PTR)
 
 
 # ---------- VPN state helpers ----------
@@ -449,6 +451,17 @@ def is_ip_entry(entry):
     return bool(re.match(r'^[\d:./]+$', entry))
 
 
+def _normalize_entry(entry):
+    """Auto-prefix bare domains with 'domain:' so the rule matches subdomains too.
+    Pass through IPs and entries that already have an xray matcher prefix."""
+    if is_ip_entry(entry):
+        return entry
+    if any(entry.startswith(p) for p in
+           ('domain:', 'full:', 'keyword:', 'regexp:', 'geosite:', 'geoip:')):
+        return entry
+    return 'domain:' + entry
+
+
 def _find_custom_rule(rules, outbound_tag, entry_type):
     """Find user-added (non-geo, non-catchall) rule for given outbound+type."""
     for rule in rules:
@@ -484,6 +497,7 @@ def get_custom_routing(cfg=None):
 
 def modify_routing(action, target, entry):
     """action: add|remove  target: direct|proxy  entry: domain or IP."""
+    entry = _normalize_entry(entry)
     cfg = read_config()
     rules = cfg['routing']['rules']
     entry_type = 'ip' if is_ip_entry(entry) else 'domain'
@@ -772,6 +786,90 @@ def api_routing_post():
         return jsonify({'error': 'invalid params'}), 400
     modify_routing(action, target, entry)
     return jsonify({'ok': True, 'routing': get_custom_routing()})
+
+
+_TRAFFIC_RE = re.compile(
+    r'^(?P<date>\S+)\s+(?P<time>\S+)\s+from\s+'
+    r'(?P<src>[\d.]+):\d+\s+accepted\s+'
+    r'(?P<proto>\w+):(?P<dst>[\w.:-]+):(?P<port>\d+)\s+'
+    r'\[(?P<route>[^\]]+)\]'
+)
+
+
+def _rdns(ip):
+    if ip in _rdns_cache:
+        return _rdns_cache[ip]
+    old_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(0.6)
+        host = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        host = ''
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+    _rdns_cache[ip] = host
+    return host
+
+
+@app.route('/api/traffic')
+def api_traffic():
+    """Tail xray access log, return recent unique destinations."""
+    limit = int(request.args.get('limit', 80))
+    flt = request.args.get('filter', '')  # '', 'proxy', 'direct', 'block'
+
+    try:
+        r = subprocess.run(['tail', '-n', '800', ACCESS_LOG],
+                           capture_output=True, text=True, timeout=3)
+        lines = (r.stdout or '').strip().split('\n')
+    except Exception as e:
+        return jsonify({'entries': [], 'error': str(e)})
+
+    entries = []
+    seen = set()
+
+    for line in reversed(lines):
+        m = _TRAFFIC_RE.match(line)
+        if not m:
+            continue
+        d = m.groupdict()
+        out = d['route'].split('->')[-1].strip()
+        if flt and out != flt:
+            continue
+        dst = d['dst']
+        # skip LAN
+        if dst.startswith(('192.168.', '10.', '127.', '169.254.')) or \
+                dst.startswith('172.') and dst.split('.')[1].isdigit() and \
+                16 <= int(dst.split('.')[1]) <= 31:
+            continue
+        key = (dst, d['port'])
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({
+            'time': d['time'].split('.')[0],
+            'source': d['src'],
+            'dest': dst,
+            'is_ip': bool(re.match(r'^[\d.]+$', dst)),
+            'port': int(d['port']),
+            'proto': d['proto'],
+            'outbound': out,
+        })
+        if len(entries) >= limit:
+            break
+
+    return jsonify({'entries': entries})
+
+
+@app.route('/api/rdns')
+def api_rdns():
+    """Reverse-DNS for comma-separated IPs (cached)."""
+    raw = request.args.get('ips') or ''
+    ips = [ip.strip() for ip in raw.split(',') if ip.strip()][:50]
+    if not ips:
+        return jsonify({})
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = dict(zip(ips, pool.map(_rdns, ips)))
+    return jsonify(results)
 
 
 @app.route('/api/pi-stats')

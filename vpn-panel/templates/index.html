@@ -169,6 +169,30 @@ h1{font-size:1.3em;font-weight:600}
 
 .empty{text-align:center;padding:20px;color:var(--text3)}
 
+/* Live traffic */
+.traffic-controls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.traffic-select{background:#08081a;border:1px solid var(--card-border);border-radius:6px;
+  padding:5px 8px;font-size:.78em;color:var(--text);font-family:inherit;outline:none}
+.traffic-list{max-height:420px;overflow-y:auto;margin:0 -10px;padding:0 10px;
+  font-family:'SF Mono',Monaco,Consolas,monospace;font-size:.78em}
+.traffic-row{display:grid;grid-template-columns:auto 1fr auto auto auto;
+  gap:8px;align-items:center;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,.03);
+  transition:background .15s}
+.traffic-row:hover{background:rgba(99,102,241,.06)}
+.t-time{color:var(--text3);font-size:.85em}
+.t-dest{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.t-dest .rdns{color:var(--text3);font-size:.9em}
+.t-port{color:var(--text3)}
+.t-out{font-size:.75em;padding:1px 6px;border-radius:3px;text-transform:uppercase;font-weight:600;letter-spacing:.3px}
+.t-out.proxy{background:rgba(99,102,241,.15);color:#a5b4fc}
+.t-out.direct{background:rgba(16,185,129,.12);color:#6ee7b7}
+.t-out.block{background:rgba(239,68,68,.15);color:#fca5a5}
+.t-btns{display:flex;gap:4px;opacity:.4;transition:opacity .15s}
+.traffic-row:hover .t-btns{opacity:1}
+.live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+  background:var(--success);margin-right:6px;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
 @media(max-width:400px){
   .info-grid{grid-template-columns:1fr}
   .controls{flex-direction:column}
@@ -294,6 +318,36 @@ h1{font-size:1.3em;font-weight:600}
       </div>
     </div>
 
+  </div>
+</div>
+
+<!-- Live traffic -->
+<div class="card" id="trafficCard">
+  <div class="section-title">
+    <div class="collapse-toggle" id="trafficToggle" onclick="toggleTraffic()">
+      <span class="arrow">&#9654;</span>
+      <span><span class="live-dot" style="display:none" id="liveDot"></span>Live трафик</span>
+    </div>
+    <button class="btn btn-outline btn-sm" onclick="loadTraffic()">⟳</button>
+  </div>
+  <div class="collapse-body" id="trafficBody">
+    <div class="hint">
+      Показывает соединения через xray в реальном времени. Если сайт не работает —
+      открой его, увидь куда идут запросы, и одним кликом отправь домен/IP в обход VPN.
+    </div>
+    <div class="traffic-controls">
+      <select class="traffic-select" id="trafficFilter" onchange="loadTraffic()">
+        <option value="">Все</option>
+        <option value="proxy" selected>Только VPN</option>
+        <option value="direct">Только напрямую</option>
+      </select>
+      <label style="font-size:.78em;color:var(--text2);display:flex;align-items:center;gap:5px;cursor:pointer">
+        <input type="checkbox" id="trafficAuto" checked onchange="toggleTrafficAuto()"> авто-обновление
+      </label>
+    </div>
+    <div class="traffic-list" id="trafficList">
+      <div class="empty">Раскройте раздел для просмотра…</div>
+    </div>
   </div>
 </div>
 
@@ -652,6 +706,105 @@ async function removeRouting(target, entry) {
     toast('Удалено', 'success');
   } else {
     toast('Ошибка', 'error');
+  }
+}
+
+// ---- Live traffic ----
+
+let _trafficOpen = false;
+let _trafficTimer = null;
+const _rdnsResolved = {};  // ip -> hostname (client-side cache)
+
+function toggleTraffic() {
+  _trafficOpen = !_trafficOpen;
+  $('trafficToggle').classList.toggle('open', _trafficOpen);
+  $('trafficBody').classList.toggle('open', _trafficOpen);
+  $('liveDot').style.display = _trafficOpen ? 'inline-block' : 'none';
+  if (_trafficOpen) {
+    loadTraffic();
+    if ($('trafficAuto').checked) startTrafficAuto();
+  } else {
+    stopTrafficAuto();
+  }
+}
+
+function toggleTrafficAuto() {
+  if ($('trafficAuto').checked && _trafficOpen) startTrafficAuto();
+  else stopTrafficAuto();
+}
+
+function startTrafficAuto() {
+  stopTrafficAuto();
+  _trafficTimer = setInterval(loadTraffic, 3000);
+}
+
+function stopTrafficAuto() {
+  if (_trafficTimer) { clearInterval(_trafficTimer); _trafficTimer = null; }
+}
+
+function trafficRow(e) {
+  const rdns = e.is_ip && _rdnsResolved[e.dest]
+    ? ` <span class="rdns">(${esc(_rdnsResolved[e.dest])})</span>`
+    : (e.is_ip ? ` <span class="rdns" data-rdns="${e.dest}"></span>` : '');
+  return `
+    <div class="traffic-row">
+      <span class="t-time">${esc(e.time)}</span>
+      <span class="t-dest">${esc(e.dest)}${rdns}</span>
+      <span class="t-port">:${e.port}</span>
+      <span class="t-out ${e.outbound}">${esc(e.outbound)}</span>
+      <span class="t-btns">
+        <button class="btn btn-xs btn-success" onclick="quickRoute('direct','${esc(e.dest)}')" title="В обход VPN">→ Direct</button>
+        <button class="btn btn-xs btn-primary" onclick="quickRoute('proxy','${esc(e.dest)}')" title="Принудительно через VPN">→ Proxy</button>
+      </span>
+    </div>`;
+}
+
+async function loadTraffic() {
+  const filter = $('trafficFilter').value;
+  const q = filter ? `?filter=${filter}` : '';
+  let d;
+  try {
+    d = await fetch('/api/traffic' + q).then(r => r.json());
+  } catch (e) {
+    return;
+  }
+  if (!d || !d.entries) return;
+
+  if (!d.entries.length) {
+    $('trafficList').innerHTML = '<div class="empty">Нет записей. Попробуй открыть сайт.</div>';
+    return;
+  }
+  $('trafficList').innerHTML = d.entries.map(trafficRow).join('');
+
+  // Async reverse-DNS for unresolved IPs
+  const ips = [...new Set(
+    d.entries.filter(e => e.is_ip && !(e.dest in _rdnsResolved)).map(e => e.dest)
+  )];
+  if (ips.length) {
+    try {
+      const rdns = await fetch('/api/rdns?ips=' + ips.join(',')).then(r => r.json());
+      for (const [ip, host] of Object.entries(rdns)) {
+        _rdnsResolved[ip] = host || '';
+        if (host) {
+          document.querySelectorAll(`[data-rdns="${CSS.escape(ip)}"]`)
+            .forEach(el => el.textContent = '(' + host + ')');
+        }
+      }
+    } catch (e) {}
+  }
+}
+
+async function quickRoute(target, entry) {
+  const d = await api('routing', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'add', target, entry})
+  });
+  if (d && d.ok) {
+    toast(`${entry} → ${target === 'direct' ? 'обход VPN' : 'через VPN'}`, 'success');
+    if (_routingOpen) loadRouting();
+  } else {
+    toast('Ошибка: ' + (d?.error || '?'), 'error');
   }
 }
 
