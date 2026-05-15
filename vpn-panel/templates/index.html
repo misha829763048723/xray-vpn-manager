@@ -143,6 +143,19 @@ h1{font-size:1.3em;font-weight:600}
 .chip .remove-btn{cursor:pointer;opacity:.6;font-size:1.1em;line-height:1;padding:0 1px}
 .chip .remove-btn:hover{opacity:1;color:var(--danger)}
 
+.preset-row{display:flex;align-items:center;gap:10px;padding:10px;
+  background:rgba(255,255,255,.02);border:1px solid var(--card-border);
+  border-radius:8px;transition:background .15s}
+.preset-row:hover{background:rgba(99,102,241,.06)}
+.preset-info{flex:1;min-width:0}
+.preset-name{font-size:.88em;font-weight:600;color:var(--text);margin-bottom:3px}
+.preset-desc{font-size:.74em;color:var(--text3);line-height:1.4}
+.preset-actions{display:flex;gap:5px;flex-shrink:0}
+.preset-target-direct{background:rgba(16,185,129,.12);color:#6ee7b7;
+  font-size:.65em;padding:1px 6px;border-radius:3px;text-transform:uppercase;letter-spacing:.3px}
+.preset-target-proxy{background:rgba(99,102,241,.15);color:#a5b4fc;
+  font-size:.65em;padding:1px 6px;border-radius:3px;text-transform:uppercase;letter-spacing:.3px}
+
 .routing-add{display:flex;gap:6px;margin-top:8px}
 .routing-input{flex:1;background:#08081a;border:1px solid var(--card-border);
   border-radius:6px;padding:7px 10px;font-size:.82em;color:var(--text);
@@ -311,6 +324,21 @@ h1{font-size:1.3em;font-weight:600}
         <span class="chip builtin">geosite:category-ru</span>
         <span class="chip builtin">geoip:ru</span>
         <span class="chip builtin">geoip:private</span>
+      </div>
+    </div>
+
+    <!-- Presets -->
+    <div class="routing-section">
+      <div class="routing-section-title">
+        <span style="background:var(--warning);width:7px;height:7px;border-radius:50%"></span>
+        Шаблоны
+      </div>
+      <div class="hint">
+        Применить готовый набор правил для популярных сервисов одной кнопкой.
+        Полезно когда CDN сайта раскидан по тысячам IP.
+      </div>
+      <div id="presetList" style="display:flex;flex-direction:column;gap:6px">
+        <div class="empty" style="padding:8px">Загружаю…</div>
       </div>
     </div>
 
@@ -720,6 +748,48 @@ async function loadRouting() {
   if (!d) return;
   renderChips(d.direct_domains.concat(d.direct_ips), 'direct', 'directList');
   renderChips(d.proxy_domains.concat(d.proxy_ips), 'proxy', 'proxyList');
+  loadPresets();
+}
+
+async function loadPresets() {
+  const d = await api('presets');
+  if (!d) return;
+  const rows = Object.entries(d).map(([key, p]) => {
+    const tCls = p.target === 'direct' ? 'preset-target-direct' : 'preset-target-proxy';
+    const tLabel = p.target === 'direct' ? 'direct' : 'proxy';
+    return `
+      <div class="preset-row">
+        <div class="preset-info">
+          <div class="preset-name">${esc(p.name)}
+            <span class="${tCls}">${tLabel}</span>
+            <span style="font-size:.7em;color:var(--text3);font-weight:400">${p.count} правил</span>
+          </div>
+          <div class="preset-desc">${esc(p.description)}</div>
+        </div>
+        <div class="preset-actions">
+          <button class="btn btn-success btn-sm" onclick="applyPreset('${esc(key)}','add')">+ Применить</button>
+          <button class="btn btn-outline btn-sm" onclick="applyPreset('${esc(key)}','remove')" title="Откатить">✕</button>
+        </div>
+      </div>`;
+  }).join('');
+  $('presetList').innerHTML = rows;
+}
+
+async function applyPreset(name, action) {
+  const verb = action === 'add' ? 'Применяю' : 'Откатываю';
+  toast(`${verb} «${name}»…`, '');
+  const d = await api('presets/apply', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({preset: name, action})
+  });
+  if (d && d.ok) {
+    toast(`Готово: ${d.count} правил (${d.target})`, 'success');
+    renderChips(d.routing.direct_domains.concat(d.routing.direct_ips), 'direct', 'directList');
+    renderChips(d.routing.proxy_domains.concat(d.routing.proxy_ips), 'proxy', 'proxyList');
+  } else {
+    toast('Ошибка: ' + (d?.error || '?'), 'error');
+  }
 }
 
 async function addRouting(target) {

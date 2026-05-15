@@ -495,24 +495,17 @@ def get_custom_routing(cfg=None):
     return out
 
 
-def modify_routing(action, target, entry):
-    """action: add|remove  target: direct|proxy  entry: domain or IP."""
+def _routing_mutate(rules, action, target, entry):
+    """In-place add/remove of a single entry in `rules`. No I/O, no restart."""
     entry = _normalize_entry(entry)
-    cfg = read_config()
-    rules = cfg['routing']['rules']
     entry_type = 'ip' if is_ip_entry(entry) else 'domain'
 
-    # Find catch-all rule index
     catchall_idx = len(rules)
     for i, rule in enumerate(rules):
         if (rule.get('outboundTag') == 'proxy' and
                 '0.0.0.0/0' in rule.get('ip', [])):
             catchall_idx = i
             break
-
-    # proxy custom rules go at index 1 (after DNS, before private-IP rule) so
-    # they can override category-ru/geoip-ru if needed.
-    # direct custom rules go just before the catch-all.
     insert_at = 1 if target == 'proxy' else catchall_idx
 
     custom = _find_custom_rule(rules, target, entry_type)
@@ -533,9 +526,152 @@ def modify_routing(action, target, entry):
             if not custom[entry_type]:
                 rules.remove(custom)
 
+
+def modify_routing(action, target, entry):
+    """action: add|remove  target: direct|proxy  entry: domain or IP."""
+    cfg = read_config()
+    _routing_mutate(cfg['routing']['rules'], action, target, entry)
     with open(CONFIG, 'w') as f:
         json.dump(cfg, f, indent=2)
     _apply_config()
+
+
+# ---------- Routing presets ----------
+
+ROUTING_PRESETS = {
+    'aviasales': {
+        'name': '✈️ Aviasales / Tutu / Skyscanner',
+        'description': 'Авиабилеты и аггрегаторы — Yandex.Cloud, CloudFront, AWS EU',
+        'target': 'direct',
+        'entries': [
+            'aviasales.ru', 'aviasales.com', 'tutu.ru',
+            'skyscanner.ru', 'skyscanner.net', 'jetradar.com',
+            '158.160.0.0/16',     # Yandex.Cloud
+            '213.180.192.0/19',   # Yandex
+            '77.88.0.0/18',       # Yandex
+            '13.32.0.0/15',       # CloudFront
+            '13.224.0.0/14',
+            '18.244.0.0/15',
+            '52.84.0.0/15',
+            '65.8.0.0/16',
+            '3.160.0.0/12',
+            '13.48.0.0/15',       # AWS eu-north-1
+            '13.53.0.0/16',
+            '3.5.0.0/16',
+        ],
+    },
+    'yandex': {
+        'name': '🟡 Yandex (все сервисы)',
+        'description': 'Поиск, Карты, Метрика, Кинопоиск, Музыка, Маркет',
+        'target': 'direct',
+        'entries': [
+            'yandex.ru', 'yandex.net', 'yandex.com', 'ya.ru',
+            'kinopoisk.ru', 'kinopoisk.com',
+            'appmetrica.ru', 'appmetrica.io',
+            'yandexcloud.net', 'mds.yandex.net', 'mc.yandex.ru',
+            '5.45.192.0/18', '5.255.192.0/18',
+            '77.88.0.0/18', '87.250.224.0/19',
+            '93.158.128.0/18', '95.108.128.0/17',
+            '141.8.128.0/18', '178.154.128.0/17',
+            '213.180.192.0/19', '158.160.0.0/16',
+        ],
+    },
+    'apple': {
+        'name': '🍏 Apple (iCloud, App Store)',
+        'description': 'iCloud, App Store, Push, FaceTime, iMessage',
+        'target': 'direct',
+        'entries': [
+            'apple.com', 'icloud.com', 'icloud-content.com',
+            'apple-cloudkit.com', 'mzstatic.com', 'cdn-apple.com',
+            'apple.news', 'me.com', 'mac.com',
+            '17.0.0.0/8',
+        ],
+    },
+    'google': {
+        'name': '🟢 Google (поиск, YouTube, Maps)',
+        'description': 'Гугл-сервисы кроме РФ-сегмента (он уже идёт direct)',
+        'target': 'direct',
+        'entries': [
+            'google.com', 'youtube.com', 'googleapis.com',
+            'gstatic.com', 'googleusercontent.com',
+            'googlevideo.com', 'ytimg.com', 'ggpht.com',
+        ],
+    },
+    'banks-ru': {
+        'name': '🏦 Российские банки',
+        'description': 'Сбер, Тинькофф, ВТБ, Альфа, ГосУслуги — direct',
+        'target': 'direct',
+        'entries': [
+            'sberbank.ru', 'sber.ru',
+            'tinkoff.ru', 'tbank.ru',
+            'vtb.ru', 'vtb24.ru',
+            'alfabank.ru',
+            'gosuslugi.ru', 'госуслуги.рф',
+            'nalog.ru', 'nalog.gov.ru',
+        ],
+    },
+    'telegram': {
+        'name': '✉️ Telegram через VPN',
+        'description': 'Все DC Telegram через VPN (часто нужно для стикеров/звонков)',
+        'target': 'proxy',
+        'entries': [
+            'telegram.org', 't.me', 'telegram.me',
+            '149.154.160.0/20',
+            '91.108.4.0/22', '91.108.8.0/22',
+            '91.108.12.0/22', '91.108.16.0/22',
+            '91.108.56.0/22',
+        ],
+    },
+}
+
+
+def apply_preset(preset_name, target_override=None, action='add'):
+    """Apply a preset's entries in one batch (single xray restart)."""
+    if preset_name not in ROUTING_PRESETS:
+        raise ValueError(f'unknown preset: {preset_name}')
+    preset = ROUTING_PRESETS[preset_name]
+    target = target_override or preset['target']
+
+    cfg = read_config()
+    rules = cfg['routing']['rules']
+    for entry in preset['entries']:
+        _routing_mutate(rules, action, target, entry)
+    with open(CONFIG, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    _apply_config()
+    return preset, target
+
+
+@app.route('/api/presets')
+def api_presets_list():
+    out = {}
+    for k, v in ROUTING_PRESETS.items():
+        out[k] = {
+            'name': v['name'],
+            'description': v['description'],
+            'target': v['target'],
+            'count': len(v['entries']),
+        }
+    return jsonify(out)
+
+
+@app.route('/api/presets/apply', methods=['POST'])
+def api_presets_apply():
+    data = request.json or {}
+    name = data.get('preset', '')
+    target = data.get('target') or None
+    action = data.get('action', 'add')
+    if action not in ('add', 'remove'):
+        return jsonify({'error': 'invalid action'}), 400
+    try:
+        preset, used_target = apply_preset(name, target, action)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify({
+        'ok': True, 'preset': name, 'target': used_target,
+        'count': len(preset['entries']),
+        'routing': get_custom_routing(),
+    })
 
 
 # ---------- iptables helpers ----------
