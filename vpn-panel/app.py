@@ -797,8 +797,13 @@ _TRAFFIC_RE = re.compile(
 
 
 def _rdns(ip):
+    """Resolve IP -> hostname. Try PTR first, fall back to ASN/org via ip-api.com.
+    Returns a string label (or '' if everything fails). Cached forever in-process."""
     if ip in _rdns_cache:
         return _rdns_cache[ip]
+
+    # 1. Reverse DNS (PTR) — fast, local
+    host = ''
     old_timeout = socket.getdefaulttimeout()
     try:
         socket.setdefaulttimeout(0.6)
@@ -807,8 +812,31 @@ def _rdns(ip):
         host = ''
     finally:
         socket.setdefaulttimeout(old_timeout)
-    _rdns_cache[ip] = host
-    return host
+
+    if host:
+        _rdns_cache[ip] = host
+        return host
+
+    # 2. Fall back to ip-api.com for org/ISP name
+    label = ''
+    try:
+        r = subprocess.run(
+            ['curl', '-s', '--max-time', '3',
+             f'http://ip-api.com/json/{ip}?fields=status,org,isp,as'],
+            capture_output=True, text=True, timeout=4,
+        )
+        info = json.loads(r.stdout or '{}')
+        if info.get('status') == 'success':
+            label = info.get('org') or info.get('isp') or ''
+            if not label:
+                asn = info.get('as') or ''
+                # 'AS15169 Google LLC' -> 'Google LLC'
+                label = asn.split(' ', 1)[1] if ' ' in asn else asn
+    except Exception:
+        pass
+
+    _rdns_cache[ip] = label
+    return label
 
 
 @app.route('/api/traffic')
@@ -867,7 +895,7 @@ def api_rdns():
     ips = [ip.strip() for ip in raw.split(',') if ip.strip()][:50]
     if not ips:
         return jsonify({})
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
         results = dict(zip(ips, pool.map(_rdns, ips)))
     return jsonify(results)
 
