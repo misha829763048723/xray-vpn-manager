@@ -764,6 +764,7 @@ let _captureSince = null;       // 'HH:MM:SS' or null
 let _searchTimer = null;
 const _rdnsResolved = {};       // ip -> hostname (client-side cache)
 const _knownSources = new Set(); // populated from server responses
+let _devices = {};              // ip -> {mac, vendor, hostname} loaded from /api/devices
 
 function toggleTraffic() {
   _trafficOpen = !_trafficOpen;
@@ -771,11 +772,30 @@ function toggleTraffic() {
   $('trafficBody').classList.toggle('open', _trafficOpen);
   $('liveDot').style.display = _trafficOpen ? 'inline-block' : 'none';
   if (_trafficOpen) {
+    loadDevices();   // fetch mac/vendor/hostname for LAN IPs (slow on first call)
     loadTraffic();
     if ($('trafficAuto').checked) startTrafficAuto();
   } else {
     stopTrafficAuto();
   }
+}
+
+async function loadDevices() {
+  try {
+    const d = await fetch('/api/devices').then(r => r.json());
+    _devices = d.devices || {};
+    // force re-render of source dropdown with the new labels
+    $('sourceFilter').dataset.keys = '';
+    if (_trafficOpen) loadTraffic();
+  } catch (e) {}
+}
+
+function deviceLabel(ip) {
+  const d = _devices[ip];
+  if (!d) return ip;
+  if (d.hostname) return `${d.hostname} · ${ip}`;
+  if (d.vendor)   return `${d.vendor} · ${ip}`;
+  return ip;
 }
 
 function toggleTrafficAuto() {
@@ -865,13 +885,14 @@ function toggleCapture() {
 function updateSourceDropdown(sources) {
   const sel = $('sourceFilter');
   const current = sel.value;
-  // Only re-render if set changed
-  const newKeys = sources.map(s => s.ip).join(',');
+  // Re-render if IP set OR device labels changed
+  const deviceKey = sources.map(s => (_devices[s.ip]?.hostname||_devices[s.ip]?.vendor||'')).join('|');
+  const newKeys = sources.map(s => s.ip).join(',') + '#' + deviceKey;
   if (sel.dataset.keys === newKeys) return;
   sel.dataset.keys = newKeys;
   const opts = ['<option value="">Все устройства</option>'];
   for (const s of sources) {
-    opts.push(`<option value="${esc(s.ip)}">${esc(s.ip)} — ${s.count} зап.</option>`);
+    opts.push(`<option value="${esc(s.ip)}">${esc(deviceLabel(s.ip))} — ${s.count} зап.</option>`);
   }
   sel.innerHTML = opts.join('');
   // preserve user's selection if still valid

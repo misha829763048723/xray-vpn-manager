@@ -788,6 +788,65 @@ def api_routing_post():
     return jsonify({'ok': True, 'routing': get_custom_routing()})
 
 
+_devices_cache = {}  # ip -> {'mac', 'vendor', 'hostname', 'ts'}
+_devices_lock = threading.Lock()
+
+
+def _arp_table():
+    """Read /proc/net/arp -> {ip: mac}."""
+    out = {}
+    try:
+        with open('/proc/net/arp') as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and parts[3] != '00:00:00:00:00:00':
+                    out[parts[0]] = parts[3]
+    except Exception:
+        pass
+    return out
+
+
+def _device_info(ip):
+    """Lookup hostname (mDNS) + vendor (macvendors.com) for a LAN IP. Cached 1h."""
+    with _devices_lock:
+        c = _devices_cache.get(ip)
+        if c and (time.time() - c['ts'] < 3600):
+            return c
+
+    info = {'mac': '', 'vendor': '', 'hostname': '', 'ts': time.time()}
+
+    info['mac'] = _arp_table().get(ip, '')
+
+    # mDNS hostname
+    try:
+        r = subprocess.run(['avahi-resolve', '-a', ip],
+                           capture_output=True, text=True, timeout=2)
+        if r.stdout:
+            parts = r.stdout.strip().split('\t')
+            if len(parts) >= 2:
+                info['hostname'] = parts[1].replace('.local', '')
+    except Exception:
+        pass
+
+    # MAC vendor
+    if info['mac']:
+        try:
+            r = subprocess.run(
+                ['curl', '-s', '--max-time', '2',
+                 f'https://api.macvendors.com/{info["mac"]}'],
+                capture_output=True, text=True, timeout=3,
+            )
+            v = (r.stdout or '').strip()
+            if v and not v.startswith('{') and 'error' not in v.lower():
+                info['vendor'] = v
+        except Exception:
+            pass
+
+    with _devices_lock:
+        _devices_cache[ip] = info
+    return info
+
+
 _TRAFFIC_RE = re.compile(
     r'^(?P<date>\S+)\s+(?P<time>\S+)\s+from\s+'
     r'(?P<src>[\d.]+):\d+\s+accepted\s+'
@@ -930,6 +989,20 @@ def api_rdns():
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = dict(zip(ips, pool.map(_rdns, ips)))
     return jsonify(results)
+
+
+@app.route('/api/devices')
+def api_devices():
+    """Return LAN device info (mac/vendor/hostname) for all IPs in ARP table."""
+    ips = list(_arp_table().keys())
+    if not ips:
+        return jsonify({'devices': {}})
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = dict(zip(ips, pool.map(_device_info, ips)))
+    # strip 'ts' from response
+    clean = {ip: {k: v for k, v in info.items() if k != 'ts'}
+             for ip, info in results.items()}
+    return jsonify({'devices': clean})
 
 
 @app.route('/api/pi-stats')
