@@ -453,13 +453,17 @@ def is_ip_entry(entry):
 
 def _normalize_entry(entry):
     """Auto-prefix bare domains with 'domain:' so the rule matches subdomains too.
+    Lowercase domains (xray domain matching is case-sensitive).
     Pass through IPs and entries that already have an xray matcher prefix."""
     if is_ip_entry(entry):
         return entry
-    if any(entry.startswith(p) for p in
-           ('domain:', 'full:', 'keyword:', 'regexp:', 'geosite:', 'geoip:')):
-        return entry
-    return 'domain:' + entry
+    # split off matcher prefix if present
+    for prefix in ('domain:', 'full:', 'keyword:', 'regexp:'):
+        if entry.startswith(prefix):
+            return prefix + entry[len(prefix):].lower()
+    if any(entry.startswith(p) for p in ('geosite:', 'geoip:')):
+        return entry  # geosite/geoip handled as-is
+    return 'domain:' + entry.lower()
 
 
 def _find_custom_rule(rules, outbound_tag, entry_type):
