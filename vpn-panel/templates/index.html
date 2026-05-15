@@ -361,14 +361,23 @@ h1{font-size:1.3em;font-weight:600}
     </div>
     <div class="traffic-controls">
       <select class="traffic-select" id="trafficFilter" onchange="loadTraffic()">
-        <option value="">Все</option>
+        <option value="">Все маршруты</option>
         <option value="proxy" selected>Только VPN</option>
         <option value="direct">Только напрямую</option>
       </select>
+      <select class="traffic-select" id="sourceFilter" onchange="loadTraffic()">
+        <option value="">Все устройства</option>
+      </select>
+      <button class="btn btn-outline btn-sm" id="captureBtn" onclick="toggleCapture()">🔴 Захват</button>
+    </div>
+    <div class="traffic-controls">
+      <input class="routing-input" id="trafficSearch" placeholder="🔎 фильтр по имени/IP"
+             style="flex:1" oninput="debouncedSearch()">
       <label style="font-size:.78em;color:var(--text2);display:flex;align-items:center;gap:5px;cursor:pointer">
-        <input type="checkbox" id="trafficAuto" checked onchange="toggleTrafficAuto()"> авто-обновление
+        <input type="checkbox" id="trafficAuto" checked onchange="toggleTrafficAuto()"> авто
       </label>
     </div>
+    <div id="captureLabel" style="font-size:.75em;color:var(--warning);margin-bottom:6px;display:none"></div>
     <div class="traffic-list" id="trafficList">
       <div class="empty">Раскройте раздел для просмотра…</div>
     </div>
@@ -751,7 +760,10 @@ async function removeRouting(target, entry) {
 
 let _trafficOpen = false;
 let _trafficTimer = null;
-const _rdnsResolved = {};  // ip -> hostname (client-side cache)
+let _captureSince = null;       // 'HH:MM:SS' or null
+let _searchTimer = null;
+const _rdnsResolved = {};       // ip -> hostname (client-side cache)
+const _knownSources = new Set(); // populated from server responses
 
 function toggleTraffic() {
   _trafficOpen = !_trafficOpen;
@@ -821,19 +833,75 @@ function closeTrafficModal(ev) {
   $('trafficModal').classList.remove('open');
 }
 
+function debouncedSearch() {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(loadTraffic, 250);
+}
+
+function toggleCapture() {
+  if (_captureSince) {
+    // stop capture
+    _captureSince = null;
+    $('captureBtn').textContent = '🔴 Захват';
+    $('captureBtn').classList.remove('btn-warning');
+    $('captureBtn').classList.add('btn-outline');
+    $('captureLabel').style.display = 'none';
+  } else {
+    // start capture: set timestamp to now (Pi local time = MSK)
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    const ss = String(now.getSeconds()).padStart(2, '0');
+    _captureSince = `${hh}:${mm}:${ss}`;
+    $('captureBtn').textContent = '⏹ Стоп';
+    $('captureBtn').classList.remove('btn-outline');
+    $('captureBtn').classList.add('btn-warning');
+    $('captureLabel').textContent = `⏺ Захват с ${_captureSince} — открой нужный сайт`;
+    $('captureLabel').style.display = 'block';
+  }
+  loadTraffic();
+}
+
+function updateSourceDropdown(sources) {
+  const sel = $('sourceFilter');
+  const current = sel.value;
+  // Only re-render if set changed
+  const newKeys = sources.map(s => s.ip).join(',');
+  if (sel.dataset.keys === newKeys) return;
+  sel.dataset.keys = newKeys;
+  const opts = ['<option value="">Все устройства</option>'];
+  for (const s of sources) {
+    opts.push(`<option value="${esc(s.ip)}">${esc(s.ip)} — ${s.count} зап.</option>`);
+  }
+  sel.innerHTML = opts.join('');
+  // preserve user's selection if still valid
+  if (current && sources.some(s => s.ip === current)) sel.value = current;
+}
+
 async function loadTraffic() {
+  const params = new URLSearchParams();
   const filter = $('trafficFilter').value;
-  const q = filter ? `?filter=${filter}` : '';
+  const source = $('sourceFilter').value;
+  const search = $('trafficSearch').value.trim();
+  if (filter)        params.set('filter', filter);
+  if (source)        params.set('source', source);
+  if (search)        params.set('search', search);
+  if (_captureSince) params.set('since',  _captureSince);
+
   let d;
   try {
-    d = await fetch('/api/traffic' + q).then(r => r.json());
+    d = await fetch('/api/traffic?' + params).then(r => r.json());
   } catch (e) {
     return;
   }
-  if (!d || !d.entries) return;
+  if (!d) return;
+  if (d.sources) updateSourceDropdown(d.sources);
 
-  if (!d.entries.length) {
-    $('trafficList').innerHTML = '<div class="empty">Нет записей. Попробуй открыть сайт.</div>';
+  if (!d.entries || !d.entries.length) {
+    const hint = _captureSince
+      ? 'Пока пусто. Открой сайт на нужном устройстве…'
+      : 'Нет записей под текущие фильтры.';
+    $('trafficList').innerHTML = `<div class="empty">${hint}</div>`;
     return;
   }
   $('trafficList').innerHTML = d.entries.map(trafficRow).join('');

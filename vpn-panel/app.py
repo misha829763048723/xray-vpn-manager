@@ -841,41 +841,69 @@ def _rdns(ip):
 
 @app.route('/api/traffic')
 def api_traffic():
-    """Tail xray access log, return recent unique destinations."""
-    limit = int(request.args.get('limit', 80))
-    flt = request.args.get('filter', '')  # '', 'proxy', 'direct', 'block'
+    """Tail xray access log, return recent unique destinations.
+    Query params:
+      filter: '', 'proxy', 'direct', 'block'
+      source: source IP to filter to (LAN device)
+      since:  'HH:MM:SS' — only entries with time >= this
+      search: substring filter on dest
+      limit:  max entries to return (default 80)
+    """
+    limit  = int(request.args.get('limit', 80))
+    flt    = request.args.get('filter', '')
+    source = (request.args.get('source') or '').strip()
+    since  = (request.args.get('since')  or '').strip()
+    search = (request.args.get('search') or '').strip().lower()
 
     try:
-        r = subprocess.run(['tail', '-n', '800', ACCESS_LOG],
+        r = subprocess.run(['tail', '-n', '1500', ACCESS_LOG],
                            capture_output=True, text=True, timeout=3)
         lines = (r.stdout or '').strip().split('\n')
     except Exception as e:
-        return jsonify({'entries': [], 'error': str(e)})
+        return jsonify({'entries': [], 'sources': [], 'error': str(e)})
 
     entries = []
     seen = set()
+    sources_count = {}  # src_ip -> count (across all entries, before filters)
 
     for line in reversed(lines):
         m = _TRAFFIC_RE.match(line)
         if not m:
             continue
         d = m.groupdict()
+        src_ip = d['src'].split(':')[0]
+        sources_count[src_ip] = sources_count.get(src_ip, 0) + 1
+
+        # Filters
         out = d['route'].split('->')[-1].strip()
         if flt and out != flt:
             continue
-        dst = d['dst']
-        # skip LAN
-        if dst.startswith(('192.168.', '10.', '127.', '169.254.')) or \
-                dst.startswith('172.') and dst.split('.')[1].isdigit() and \
-                16 <= int(dst.split('.')[1]) <= 31:
+        if source and src_ip != source:
             continue
+
+        time_str = d['time'].split('.')[0]
+        if since and time_str < since:
+            continue
+
+        dst = d['dst']
+        # skip LAN destinations
+        if dst.startswith(('192.168.', '10.', '127.', '169.254.')):
+            continue
+        if dst.startswith('172.') and dst.split('.')[1].isdigit() \
+                and 16 <= int(dst.split('.')[1]) <= 31:
+            continue
+
+        if search and search not in dst.lower():
+            continue
+
         key = (dst, d['port'])
         if key in seen:
             continue
         seen.add(key)
         entries.append({
-            'time': d['time'].split('.')[0],
+            'time': time_str,
             'source': d['src'],
+            'src_ip': src_ip,
             'dest': dst,
             'is_ip': bool(re.match(r'^[\d.]+$', dst)),
             'port': int(d['port']),
@@ -885,7 +913,11 @@ def api_traffic():
         if len(entries) >= limit:
             break
 
-    return jsonify({'entries': entries})
+    # Sources sorted by activity (most active first)
+    sources = sorted(sources_count.items(), key=lambda x: -x[1])
+    sources_list = [{'ip': ip, 'count': cnt} for ip, cnt in sources]
+
+    return jsonify({'entries': entries, 'sources': sources_list})
 
 
 @app.route('/api/rdns')
