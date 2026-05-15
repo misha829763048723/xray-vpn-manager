@@ -173,33 +173,48 @@ h1{font-size:1.3em;font-weight:600}
 .traffic-controls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .traffic-select{background:#08081a;border:1px solid var(--card-border);border-radius:6px;
   padding:5px 8px;font-size:.78em;color:var(--text);font-family:inherit;outline:none}
-.traffic-list{max-height:480px;overflow-y:auto;overflow-x:auto;
-  margin:0 -10px;padding:0 10px;
-  font-family:'SF Mono',Monaco,Consolas,monospace;font-size:.78em;
-  -webkit-overflow-scrolling:touch}
-.traffic-row{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center;
-  padding:8px 4px;border-bottom:1px solid rgba(255,255,255,.04);
-  transition:background .15s}
-.traffic-row:hover{background:rgba(99,102,241,.06)}
-.t-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%}
-.t-time{color:var(--text3);font-size:.85em;flex-shrink:0}
-.t-dest{color:var(--text);word-break:break-all;flex:1 1 auto;min-width:0;line-height:1.4}
-.t-dest .rdns{color:var(--text3);font-size:.9em;word-break:break-all}
-.t-port{color:var(--text3);flex-shrink:0}
+.traffic-list{max-height:480px;overflow-y:auto;margin:0 -10px;padding:0 10px;
+  font-family:'SF Mono',Monaco,Consolas,monospace;font-size:.78em}
+.traffic-row{display:grid;grid-template-columns:auto 1fr auto auto;
+  gap:8px;align-items:center;padding:8px 4px;
+  border-bottom:1px solid rgba(255,255,255,.04);
+  cursor:pointer;transition:background .15s}
+.traffic-row:hover,.traffic-row:active{background:rgba(99,102,241,.08)}
+.t-time{color:var(--text3);font-size:.85em}
+.t-dest{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.t-dest .rdns{color:var(--text3);font-size:.9em}
+.t-port{color:var(--text3)}
 .t-out{font-size:.7em;padding:2px 7px;border-radius:3px;text-transform:uppercase;
-  font-weight:600;letter-spacing:.3px;flex-shrink:0}
+  font-weight:600;letter-spacing:.3px}
 .t-out.proxy{background:rgba(99,102,241,.15);color:#a5b4fc}
 .t-out.direct{background:rgba(16,185,129,.12);color:#6ee7b7}
 .t-out.block{background:rgba(239,68,68,.15);color:#fca5a5}
-.t-btns{display:flex;gap:6px;margin-left:auto}
-.t-btns .btn-xs{padding:5px 10px;font-size:.78em}
 .live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;
   background:var(--success);margin-right:6px;animation:pulse 1.5s infinite}
 
-@media(max-width:500px){
-  .t-btns{width:100%;justify-content:stretch;margin-left:0}
-  .t-btns .btn-xs{flex:1;padding:8px 4px;font-size:.8em}
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);
+  display:none;align-items:flex-end;justify-content:center;z-index:200;
+  backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
+.modal-overlay.open{display:flex;animation:fadein .2s ease}
+.modal-sheet{background:var(--card);border:1px solid var(--card-border);
+  border-radius:16px 16px 0 0;width:100%;max-width:640px;
+  padding:20px;animation:slideup .25s cubic-bezier(.2,.8,.2,1)}
+@media(min-width:640px){
+  .modal-overlay{align-items:center}
+  .modal-sheet{border-radius:16px;max-width:480px;animation:fadein .2s ease}
 }
+@keyframes fadein{from{opacity:0}to{opacity:1}}
+@keyframes slideup{from{transform:translateY(100%)}to{transform:translateY(0)}}
+.modal-handle{width:36px;height:4px;border-radius:2px;background:var(--text3);
+  margin:-8px auto 16px;opacity:.5}
+.modal-title{font-size:.95em;font-weight:600;margin-bottom:12px;word-break:break-all;line-height:1.4}
+.modal-meta{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;
+  font-size:.85em;margin-bottom:18px;font-family:'SF Mono',Monaco,Consolas,monospace}
+.modal-meta dt{color:var(--text3)}
+.modal-meta dd{color:var(--text);word-break:break-all}
+.modal-actions{display:flex;flex-direction:column;gap:8px}
+.modal-actions .btn{justify-content:center;padding:12px 16px;font-size:.95em}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
 @media(max-width:400px){
@@ -399,6 +414,20 @@ h1{font-size:1.3em;font-weight:600}
   </div>
   <div class="log-box" id="logBox">
     <div style="color:var(--text3)">Загрузка...</div>
+  </div>
+</div>
+
+<!-- Traffic modal -->
+<div class="modal-overlay" id="trafficModal" onclick="closeTrafficModal(event)">
+  <div class="modal-sheet" onclick="event.stopPropagation()">
+    <div class="modal-handle"></div>
+    <div class="modal-title" id="modalTitle">—</div>
+    <dl class="modal-meta" id="modalMeta"></dl>
+    <div class="modal-actions">
+      <button class="btn btn-success" id="modalDirectBtn">→ Напрямую (обход VPN)</button>
+      <button class="btn btn-primary" id="modalProxyBtn">→ Через VPN принудительно</button>
+      <button class="btn btn-outline" onclick="closeTrafficModal()">Отмена</button>
+    </div>
   </div>
 </div>
 
@@ -755,17 +784,41 @@ function trafficRow(e) {
   const rdns = e.is_ip && _rdnsResolved[e.dest]
     ? ` <span class="rdns">(${esc(_rdnsResolved[e.dest])})</span>`
     : (e.is_ip ? ` <span class="rdns" data-rdns="${e.dest}"></span>` : '');
+  const payload = encodeURIComponent(JSON.stringify(e));
   return `
-    <div class="traffic-row">
+    <div class="traffic-row" onclick="openTrafficModal('${payload}')">
       <span class="t-time">${esc(e.time)}</span>
       <span class="t-dest">${esc(e.dest)}${rdns}</span>
       <span class="t-port">:${e.port}</span>
       <span class="t-out ${e.outbound}">${esc(e.outbound)}</span>
-      <span class="t-btns">
-        <button class="btn btn-xs btn-success" onclick="quickRoute('direct','${esc(e.dest)}')" title="В обход VPN">→ Direct</button>
-        <button class="btn btn-xs btn-primary" onclick="quickRoute('proxy','${esc(e.dest)}')" title="Принудительно через VPN">→ Proxy</button>
-      </span>
     </div>`;
+}
+
+function openTrafficModal(payload) {
+  const e = JSON.parse(decodeURIComponent(payload));
+  const rdns = e.is_ip ? (_rdnsResolved[e.dest] || '') : '';
+  $('modalTitle').textContent = e.dest + (rdns ? ' (' + rdns + ')' : '');
+  const meta = [
+    ['Назначение', e.dest],
+    ...(rdns ? [['Хост (rDNS)', rdns]] : []),
+    ['Порт', e.port + ' / ' + e.proto.toUpperCase()],
+    ['Источник', e.source],
+    ['Маршрут', e.outbound],
+    ['Время', e.time],
+  ];
+  $('modalMeta').innerHTML = meta.map(([k,v]) =>
+    `<dt>${esc(k)}</dt><dd>${esc(String(v))}</dd>`).join('');
+
+  const target = rdns || e.dest;
+  $('modalDirectBtn').onclick = () => { quickRoute('direct', target); closeTrafficModal(); };
+  $('modalProxyBtn').onclick  = () => { quickRoute('proxy',  target); closeTrafficModal(); };
+
+  $('trafficModal').classList.add('open');
+}
+
+function closeTrafficModal(ev) {
+  if (ev && ev.target.id !== 'trafficModal') return;
+  $('trafficModal').classList.remove('open');
 }
 
 async function loadTraffic() {
